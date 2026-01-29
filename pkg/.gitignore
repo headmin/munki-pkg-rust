@@ -1,0 +1,8 @@
+# Build output
+build/
+
+# Payload is populated by release script
+payload/usr/local/bin/munkipkg
+
+# macOS artifacts
+.DS_Store

@@ -1,0 +1,451 @@
+//! Package building functionality
+//!
+//! Implements the core package building workflow using macOS
+//! pkgbuild and productbuild tools.
+//!
+//! Original algorithm by Greg Neagle in munki-pkg.
+
+use crate::config::{BuildInfo, PostinstallAction};
+use crate::external::{
+    self, PKGBUILD, PRODUCTBUILD, ditto_copy, lsbom_extract, productsign, run_command_checked,
+    stapler_staple,
+};
+use crate::project::{
+    get_payload_dir, get_scripts_dir, has_payload, has_scripts, validate_project,
+};
+use anyhow::{Context, Result, bail};
+use std::fs::{self, File};
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use tempfile::TempDir;
+use walkdir::WalkDir;
+
+/// Build a package from a project directory
+#[allow(clippy::too_many_arguments)]
+pub fn build_package(
+    project_dir: &Path,
+    export_bom: bool,
+    quiet: bool,
+    skip_signing: bool,
+    skip_notarization: bool,
+    skip_stapling: bool,
+) -> Result<()> {
+    // Validate project structure
+    validate_project(project_dir)?;
+
+    // Verify required tools are available
+    external::verify_tools()?;
+
+    // Load build info
+    let build_info = BuildInfo::load(project_dir)?;
+    build_info.validate()?;
+
+    if !quiet {
+        println!("Building package: {}", build_info.resolved_name());
+    }
+
+    // Create temporary working directory
+    let temp_dir = TempDir::new().context("Failed to create temporary directory")?;
+
+    // Create build output directory
+    let build_dir = project_dir.join("build");
+    fs::create_dir_all(&build_dir)
+        .with_context(|| format!("Failed to create build directory: {}", build_dir.display()))?;
+
+    // Determine if we have payload and/or scripts
+    let has_payload_content = has_payload(project_dir);
+    let has_script_content = has_scripts(project_dir);
+
+    if !has_payload_content && !has_script_content {
+        bail!("Project has no payload and no scripts. Nothing to build.");
+    }
+
+    // Prepare payload directory (clean .DS_Store files)
+    let working_payload = if has_payload_content {
+        let payload_dir = get_payload_dir(project_dir).unwrap();
+        let working = temp_dir.path().join("payload");
+        ditto_copy(&payload_dir, &working)?;
+        clean_ds_store(&working)?;
+        Some(working)
+    } else {
+        None
+    };
+
+    // Prepare scripts directory
+    let working_scripts = if has_script_content {
+        let scripts_dir = get_scripts_dir(project_dir).unwrap();
+        let working = temp_dir.path().join("scripts");
+        ditto_copy(&scripts_dir, &working)?;
+        make_scripts_executable(&working)?;
+        Some(working)
+    } else {
+        None
+    };
+
+    // Create component property list if we have payload
+    let component_plist = if let Some(ref payload) = working_payload {
+        let plist_path = temp_dir.path().join("component.plist");
+        external::pkgbuild_analyze(payload, &plist_path)?;
+
+        // Modify component plist to suppress bundle relocation if needed
+        if build_info.suppress_bundle_relocation {
+            suppress_bundle_relocation(&plist_path)?;
+        }
+
+        Some(plist_path)
+    } else {
+        None
+    };
+
+    // Create PackageInfo if needed for postinstall action
+    let pkg_info_path = if build_info.postinstall_action != PostinstallAction::None {
+        let path = temp_dir.path().join("PackageInfo");
+        create_package_info(&path, &build_info)?;
+        Some(path)
+    } else {
+        None
+    };
+
+    // Build the package
+    let unsigned_pkg = temp_dir.path().join("unsigned.pkg");
+    build_pkg(
+        &build_info,
+        working_payload.as_deref(),
+        working_scripts.as_deref(),
+        component_plist.as_deref(),
+        pkg_info_path.as_deref(),
+        &unsigned_pkg,
+        quiet,
+    )?;
+
+    // Convert to distribution package if needed
+    let pre_sign_pkg = if build_info.distribution_style {
+        let dist_pkg = temp_dir.path().join("distribution.pkg");
+        build_distribution_pkg(&build_info, &unsigned_pkg, &dist_pkg, quiet)?;
+        dist_pkg
+    } else {
+        unsigned_pkg
+    };
+
+    // Determine final output path
+    let output_pkg = build_dir.join(build_info.resolved_name());
+
+    // Sign if configured and not skipped
+    if let Some(ref signing_info) = build_info.signing_info {
+        if skip_signing {
+            if !quiet {
+                println!("Skipping signing as requested");
+            }
+            fs::copy(&pre_sign_pkg, &output_pkg)?;
+        } else {
+            if !quiet {
+                println!("Signing package with identity: {}", signing_info.identity);
+            }
+            productsign(
+                &pre_sign_pkg,
+                &output_pkg,
+                &signing_info.identity,
+                signing_info.keychain.as_deref(),
+                signing_info.timestamp,
+            )?;
+        }
+    } else {
+        fs::copy(&pre_sign_pkg, &output_pkg)?;
+    }
+
+    // Notarize if configured and not skipped
+    if let Some(ref notarization_info) = build_info.notarization_info {
+        if skip_notarization {
+            if !quiet {
+                println!("Skipping notarization as requested");
+            }
+        } else {
+            if !quiet {
+                println!("Submitting package for notarization...");
+            }
+            notarize_package(&output_pkg, notarization_info, skip_stapling, quiet)?;
+        }
+    }
+
+    // Export BOM info if requested
+    if export_bom {
+        export_bom_info(&output_pkg, project_dir, quiet)?;
+    }
+
+    if !quiet {
+        println!("\nPackage built successfully: {}", output_pkg.display());
+    }
+
+    Ok(())
+}
+
+/// Build the component package using pkgbuild
+fn build_pkg(
+    build_info: &BuildInfo,
+    payload_dir: Option<&Path>,
+    scripts_dir: Option<&Path>,
+    component_plist: Option<&Path>,
+    pkg_info: Option<&Path>,
+    output: &Path,
+    quiet: bool,
+) -> Result<()> {
+    let mut cmd = Command::new(PKGBUILD);
+
+    // Add root directory or nopayload
+    if let Some(payload) = payload_dir {
+        cmd.arg("--root").arg(payload);
+    } else {
+        cmd.arg("--nopayload");
+    }
+
+    // Add component plist
+    if let Some(plist) = component_plist {
+        cmd.arg("--component-plist").arg(plist);
+    }
+
+    // Add scripts
+    if let Some(scripts) = scripts_dir {
+        cmd.arg("--scripts").arg(scripts);
+    }
+
+    // Add PackageInfo
+    if let Some(info) = pkg_info {
+        cmd.arg("--info").arg(info);
+    }
+
+    // Add identifier and version
+    cmd.arg("--identifier").arg(&build_info.identifier);
+    cmd.arg("--version").arg(&build_info.version);
+
+    // Add install location
+    cmd.arg("--install-location")
+        .arg(&build_info.install_location);
+
+    // Add ownership
+    cmd.arg("--ownership").arg(build_info.ownership.as_str());
+
+    // Add compression if specified
+    if let Some(ref compression) = build_info.compression {
+        cmd.arg("--compression").arg(compression.as_str());
+    }
+
+    // Add min-os-version if specified
+    if let Some(ref min_os) = build_info.min_os_version {
+        cmd.arg("--min-os-version").arg(min_os);
+    }
+
+    // Add large-payload if enabled
+    if build_info.large_payload {
+        cmd.arg("--large-payload");
+    }
+
+    // Add preserve-xattr if enabled
+    if build_info.preserve_xattr {
+        cmd.arg("--preserve-xattr");
+    }
+
+    // Add output path
+    cmd.arg(output);
+
+    if !quiet {
+        println!("Running pkgbuild...");
+    }
+
+    run_command_checked(&mut cmd)?;
+    Ok(())
+}
+
+/// Build a distribution-style package using productbuild
+fn build_distribution_pkg(
+    build_info: &BuildInfo,
+    component_pkg: &Path,
+    output: &Path,
+    quiet: bool,
+) -> Result<()> {
+    let mut cmd = Command::new(PRODUCTBUILD);
+
+    cmd.arg("--package").arg(component_pkg);
+
+    // Use product id or identifier
+    let product_id = build_info
+        .product_id
+        .as_ref()
+        .unwrap_or(&build_info.identifier);
+    cmd.arg("--identifier").arg(product_id);
+    cmd.arg("--version").arg(&build_info.version);
+
+    cmd.arg(output);
+
+    if !quiet {
+        println!("Running productbuild for distribution package...");
+    }
+
+    run_command_checked(&mut cmd)?;
+    Ok(())
+}
+
+/// Create PackageInfo XML file for postinstall actions
+fn create_package_info(path: &Path, build_info: &BuildInfo) -> Result<()> {
+    let action = match build_info.postinstall_action {
+        PostinstallAction::Logout => "logout",
+        PostinstallAction::Restart => "restart",
+        PostinstallAction::None => return Ok(()),
+    };
+
+    let content = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<pkg-info postinstall-action="{}"/>
+"#,
+        action
+    );
+
+    let mut file = File::create(path)?;
+    file.write_all(content.as_bytes())?;
+    Ok(())
+}
+
+/// Suppress bundle relocation in component plist
+fn suppress_bundle_relocation(plist_path: &Path) -> Result<()> {
+    let data = fs::read(plist_path)?;
+    let mut components: Vec<plist::Dictionary> = plist::from_bytes(&data)?;
+
+    for component in &mut components {
+        component.insert(
+            "BundleIsRelocatable".to_string(),
+            plist::Value::Boolean(false),
+        );
+    }
+
+    let mut file = File::create(plist_path)?;
+    plist::to_writer_xml(&mut file, &components)?;
+    Ok(())
+}
+
+/// Remove .DS_Store files from directory tree
+fn clean_ds_store(dir: &Path) -> Result<()> {
+    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_name() == ".DS_Store" {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Make scripts executable (mode 755)
+fn make_scripts_executable(scripts_dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(scripts_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            let mut perms = fs::metadata(&path)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms)?;
+        }
+    }
+    Ok(())
+}
+
+/// Notarize a package
+fn notarize_package(
+    pkg_path: &Path,
+    info: &crate::config::NotarizationInfo,
+    skip_stapling: bool,
+    quiet: bool,
+) -> Result<()> {
+    let result = external::notarytool_submit(
+        pkg_path,
+        info.apple_id.as_deref(),
+        info.password.as_deref(),
+        info.team_id.as_deref(),
+        info.api_key_path.as_deref(),
+        info.api_key_id.as_deref(),
+        info.api_issuer_id.as_deref(),
+    )?;
+
+    if !quiet {
+        println!("Notarization result: {}", result);
+    }
+
+    // Staple the notarization ticket
+    if !skip_stapling {
+        if !quiet {
+            println!("Stapling notarization ticket...");
+        }
+        stapler_staple(pkg_path)?;
+    }
+
+    Ok(())
+}
+
+/// Export BOM info to Bom.txt
+fn export_bom_info(pkg_path: &Path, project_dir: &Path, quiet: bool) -> Result<()> {
+    // Expand package to temp directory
+    let temp_dir = TempDir::new()?;
+    let expanded = temp_dir.path().join("expanded");
+    external::pkgutil_expand(pkg_path, &expanded)?;
+
+    // Find Bom file
+    let bom_path = find_bom_file(&expanded)?;
+
+    // Extract BOM info
+    let bom_content = lsbom_extract(&bom_path)?;
+
+    // Write to Bom.txt
+    let bom_txt = project_dir.join("Bom.txt");
+    fs::write(&bom_txt, bom_content)?;
+
+    if !quiet {
+        println!("Exported BOM info to: {}", bom_txt.display());
+    }
+
+    Ok(())
+}
+
+/// Find the Bom file in an expanded package
+fn find_bom_file(expanded_dir: &Path) -> Result<PathBuf> {
+    for entry in WalkDir::new(expanded_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let name = entry.file_name().to_string_lossy();
+        if name == "Bom" || name.ends_with(".bom") {
+            return Ok(entry.path().to_path_buf());
+        }
+    }
+    bail!("No Bom file found in expanded package");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_clean_ds_store() {
+        let temp = TempDir::new().unwrap();
+        let ds_store = temp.path().join(".DS_Store");
+        fs::write(&ds_store, "test").unwrap();
+
+        assert!(ds_store.exists());
+        clean_ds_store(temp.path()).unwrap();
+        assert!(!ds_store.exists());
+    }
+
+    #[test]
+    fn test_create_package_info() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("PackageInfo");
+
+        let build_info = BuildInfo {
+            postinstall_action: PostinstallAction::Restart,
+            ..Default::default()
+        };
+
+        create_package_info(&path, &build_info).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("postinstall-action=\"restart\""));
+    }
+}

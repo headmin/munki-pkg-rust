@@ -1,0 +1,31 @@
+[package]
+name = "munkipkg"
+version = "0.1.0"
+edition = "2024"
+description = "A modern Rust port of munki-pkg - builds macOS installer packages"
+authors = ["Original concept by Greg Neagle (munki-pkg)", "Rust port by Henry Stamerjohann"]
+repository = "https://github.com/headmin/munki-pkg-rust"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["macos", "pkg", "installer", "packaging"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+yaml_serde = "0.10"
+toml = "0.9"
+plist = "1.8"
+anyhow = "1.0"
+thiserror = "2.0"
+walkdir = "2.5"
+tempfile = "3.20"
+regex-lite = "0.1"
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

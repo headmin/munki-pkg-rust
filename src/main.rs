@@ -15,12 +15,14 @@ mod config;
 mod external;
 mod import;
 mod project;
+mod signing;
 mod sync;
 
 use build::build_package;
 use config::OutputFormat;
 use import::import_package;
 use project::{create_project, select_format_interactive};
+use signing::configure_signing_interactive;
 use sync::sync_from_bom;
 
 /// munkipkg - Build macOS installer packages
@@ -57,6 +59,10 @@ struct Cli {
     /// Skip stapling after notarization
     #[arg(long)]
     skip_stapling: bool,
+
+    /// Configure signing/notarization before building
+    #[arg(long)]
+    configure: bool,
 }
 
 #[derive(Subcommand)]
@@ -85,6 +91,10 @@ enum Commands {
         /// Skip stapling after notarization
         #[arg(long)]
         skip_stapling: bool,
+
+        /// Configure signing/notarization before building
+        #[arg(long)]
+        configure: bool,
     },
 
     /// Create a new package project
@@ -99,6 +109,16 @@ enum Commands {
         /// Overwrite existing project
         #[arg(short, long)]
         force: bool,
+
+        /// Configure signing after creation
+        #[arg(long)]
+        signing: bool,
+    },
+
+    /// Configure signing and notarization for a project
+    Configure {
+        /// Project directory to configure
+        project_dir: PathBuf,
     },
 
     /// Import an existing package into a project
@@ -132,26 +152,40 @@ fn main() -> Result<()> {
             skip_signing,
             skip_notarization,
             skip_stapling,
-        }) => build_package(
-            &project_dir,
-            export_bom_info,
-            quiet,
-            skip_signing,
-            skip_notarization,
-            skip_stapling,
-        ),
+            configure,
+        }) => {
+            if configure {
+                configure_signing_interactive(&project_dir)?;
+            }
+            build_package(
+                &project_dir,
+                export_bom_info,
+                quiet,
+                skip_signing,
+                skip_notarization,
+                skip_stapling,
+            )
+        }
 
         Some(Commands::Create {
             project_dir,
             format,
             force,
+            signing,
         }) => {
             let format = match format {
                 Some(f) => f,
                 None => select_format_interactive()?,
             };
-            create_project(&project_dir, format, force)
+            create_project(&project_dir, format, force)?;
+
+            if signing {
+                configure_signing_interactive(&project_dir)?;
+            }
+            Ok(())
         }
+
+        Some(Commands::Configure { project_dir }) => configure_signing_interactive(&project_dir),
 
         Some(Commands::Import {
             pkg_path,
@@ -163,6 +197,9 @@ fn main() -> Result<()> {
 
         None => {
             if let Some(project_dir) = cli.project_dir {
+                if cli.configure {
+                    configure_signing_interactive(&project_dir)?;
+                }
                 build_package(
                     &project_dir,
                     cli.export_bom_info,

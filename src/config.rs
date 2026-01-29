@@ -94,8 +94,12 @@ impl Compression {
 /// Signing configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SigningInfo {
-    /// Signing identity (certificate common name)
+    /// Application signing identity (Developer ID Application)
     pub identity: String,
+
+    /// Installer signing identity (Developer ID Installer) - for pkg signing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installer_identity: Option<String>,
 
     /// Path to keychain containing the signing certificate
     #[serde(skip_serializing_if = "Option::is_none")]

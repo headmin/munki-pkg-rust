@@ -15,12 +15,61 @@ use crate::project::{
 };
 use anyhow::{Context, Result, bail};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 use walkdir::WalkDir;
+
+/// Load environment variables from a .env file
+fn load_env_file(project_dir: &Path, quiet: bool) -> Result<()> {
+    // Try project_dir/.env first, then project_dir/../.env
+    let env_paths = [
+        project_dir.join(".env"),
+        project_dir
+            .parent()
+            .map(|p| p.join(".env"))
+            .unwrap_or_default(),
+    ];
+
+    for env_path in env_paths {
+        if env_path.exists() {
+            if !quiet {
+                println!("Loading environment from: {}", env_path.display());
+            }
+
+            let file = File::open(&env_path)
+                .with_context(|| format!("Failed to open {}", env_path.display()))?;
+
+            for line in BufReader::new(file).lines() {
+                let line = line?;
+                let line = line.trim();
+
+                // Skip comments and empty lines
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+
+                // Parse KEY=VALUE
+                if let Some((key, value)) = line.split_once('=') {
+                    let key = key.trim();
+                    let value = value.trim().trim_matches('"').trim_matches('\'');
+
+                    // Only set if not already in environment
+                    if std::env::var(key).is_err() {
+                        // SAFETY: Called early in single-threaded startup
+                        unsafe { std::env::set_var(key, value) };
+                    }
+                }
+            }
+
+            return Ok(());
+        }
+    }
+
+    Ok(())
+}
 
 /// Build a package from a project directory
 #[allow(clippy::too_many_arguments)]
@@ -34,6 +83,9 @@ pub fn build_package(
 ) -> Result<()> {
     // Validate project structure
     validate_project(project_dir)?;
+
+    // Load .env file if present (for op://, credentials, etc.)
+    load_env_file(project_dir, quiet)?;
 
     // Verify required tools are available
     external::verify_tools()?;
@@ -132,7 +184,7 @@ pub fn build_package(
     // Determine final output path
     let output_pkg = build_dir.join(build_info.resolved_name());
 
-    // Sign if configured and not skipped
+    // Sign package if configured and not skipped
     if let Some(ref signing_info) = build_info.signing_info {
         if skip_signing {
             if !quiet {
@@ -140,16 +192,47 @@ pub fn build_package(
             }
             fs::copy(&pre_sign_pkg, &output_pkg)?;
         } else {
-            if !quiet {
-                println!("Signing package with identity: {}", signing_info.identity);
+            // Use installer_identity for pkg signing, or derive from identity
+            let pkg_identity = signing_info
+                .installer_identity
+                .as_deref()
+                .unwrap_or_else(|| {
+                    // Try to derive installer identity from application identity
+                    // "Developer ID Application: Name" -> "Developer ID Installer: Name"
+                    &signing_info.identity
+                });
+
+            // Check if we have an installer identity (not application)
+            if pkg_identity.contains("Application") {
+                if !quiet {
+                    println!(
+                        "Warning: No installer identity configured. Attempting to derive from application identity."
+                    );
+                }
+                // Try to use the derived installer identity
+                let derived = pkg_identity.replace("Application", "Installer");
+                if !quiet {
+                    println!("Signing package with identity: {}", derived);
+                }
+                productsign(
+                    &pre_sign_pkg,
+                    &output_pkg,
+                    &derived,
+                    signing_info.keychain.as_deref(),
+                    signing_info.timestamp,
+                )?;
+            } else {
+                if !quiet {
+                    println!("Signing package with identity: {}", pkg_identity);
+                }
+                productsign(
+                    &pre_sign_pkg,
+                    &output_pkg,
+                    pkg_identity,
+                    signing_info.keychain.as_deref(),
+                    signing_info.timestamp,
+                )?;
             }
-            productsign(
-                &pre_sign_pkg,
-                &output_pkg,
-                &signing_info.identity,
-                signing_info.keychain.as_deref(),
-                signing_info.timestamp,
-            )?;
         }
     } else {
         fs::copy(&pre_sign_pkg, &output_pkg)?;
@@ -347,6 +430,44 @@ fn make_scripts_executable(scripts_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a value that might be an op:// URL, @keychain:, or @env: reference
+fn resolve_secret(value: Option<&str>, quiet: bool) -> Result<Option<String>> {
+    let Some(val) = value else {
+        return Ok(None);
+    };
+
+    if val.starts_with("op://") {
+        // 1Password CLI
+        if !quiet {
+            println!("Resolving 1Password reference...");
+        }
+        let output = std::process::Command::new("op")
+            .args(["read", val])
+            .output()
+            .context("Failed to run 'op' CLI. Is 1Password CLI installed?")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to read from 1Password: {}", stderr);
+        }
+
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ))
+    } else if val.starts_with("@keychain:") {
+        // macOS Keychain - pass through for notarytool to handle
+        Ok(Some(val.to_string()))
+    } else if let Some(var_name) = val.strip_prefix("@env:") {
+        // Environment variable (can be loaded from .env file)
+        let resolved = std::env::var(var_name)
+            .with_context(|| format!("Environment variable {} not set", var_name))?;
+        Ok(Some(resolved))
+    } else {
+        // Plain value
+        Ok(Some(val.to_string()))
+    }
+}
+
 /// Notarize a package
 fn notarize_package(
     pkg_path: &Path,
@@ -354,11 +475,16 @@ fn notarize_package(
     skip_stapling: bool,
     quiet: bool,
 ) -> Result<()> {
+    // Resolve any op://, @keychain:, or @env: references
+    let apple_id = resolve_secret(info.apple_id.as_deref(), quiet)?;
+    let password = resolve_secret(info.password.as_deref(), quiet)?;
+    let team_id = resolve_secret(info.team_id.as_deref(), quiet)?;
+
     let result = external::notarytool_submit(
         pkg_path,
-        info.apple_id.as_deref(),
-        info.password.as_deref(),
-        info.team_id.as_deref(),
+        apple_id.as_deref(),
+        password.as_deref(),
+        team_id.as_deref(),
         info.api_key_path.as_deref(),
         info.api_key_id.as_deref(),
         info.api_issuer_id.as_deref(),

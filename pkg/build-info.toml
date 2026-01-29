@@ -1,0 +1,19 @@
+# munkipkg package configuration
+# This pkg installs munkipkg itself - dogfooding!
+#
+# Original munkipkg concept by Greg Neagle
+# https://github.com/munki/munki-pkg
+
+name = "munkipkg-${version}.pkg"
+identifier = "com.github.headmin.munkipkg"
+version = "0.1.0"
+
+# Install to /usr/local/bin
+install_location = "/"
+ownership = "recommended"
+
+# Package options
+distribution_style = false
+suppress_bundle_relocation = true
+postinstall_action = "none"
+preserve_xattr = false

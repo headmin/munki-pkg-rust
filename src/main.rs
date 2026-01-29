@@ -20,7 +20,7 @@ mod sync;
 use build::build_package;
 use config::OutputFormat;
 use import::import_package;
-use project::create_project;
+use project::{create_project, select_format_interactive};
 use sync::sync_from_bom;
 
 /// munkipkg - Build macOS installer packages
@@ -92,9 +92,9 @@ enum Commands {
         /// Path for new project directory
         project_dir: PathBuf,
 
-        /// Output format for build-info file
-        #[arg(long, value_enum, default_value = "plist")]
-        format: OutputFormat,
+        /// Output format for build-info file (prompts if not specified)
+        #[arg(long, value_enum)]
+        format: Option<OutputFormat>,
 
         /// Overwrite existing project
         #[arg(short, long)]
@@ -110,7 +110,7 @@ enum Commands {
         project_dir: PathBuf,
 
         /// Output format for build-info file
-        #[arg(long, value_enum, default_value = "plist")]
+        #[arg(long, value_enum, default_value = "toml")]
         format: OutputFormat,
     },
 
@@ -145,7 +145,13 @@ fn main() -> Result<()> {
             project_dir,
             format,
             force,
-        }) => create_project(&project_dir, format, force),
+        }) => {
+            let format = match format {
+                Some(f) => f,
+                None => select_format_interactive()?,
+            };
+            create_project(&project_dir, format, force)
+        }
 
         Some(Commands::Import {
             pkg_path,

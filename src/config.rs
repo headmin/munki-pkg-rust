@@ -14,10 +14,10 @@ use std::path::Path;
 /// Output format for build-info files
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
 pub enum OutputFormat {
-    #[default]
     Plist,
     Json,
     Yaml,
+    #[default]
     Toml,
 }
 

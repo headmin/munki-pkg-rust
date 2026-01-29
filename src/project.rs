@@ -5,6 +5,7 @@
 
 use crate::config::{BuildInfo, OutputFormat};
 use anyhow::{Context, Result, bail};
+use inquire::Select;
 use std::fs;
 use std::path::Path;
 
@@ -15,6 +16,29 @@ const DEFAULT_GITIGNORE: &str = r#"# .DS_Store files!
 # Build output directory
 build/
 "#;
+
+/// Prompt user to select output format interactively
+pub fn select_format_interactive() -> Result<OutputFormat> {
+    let options = vec![
+        "toml  - TOML format (recommended)",
+        "plist - Apple Property List (XML)",
+        "json  - JSON format",
+        "yaml  - YAML format",
+    ];
+
+    let selection = Select::new("Select build-info format:", options)
+        .with_help_message("TOML is the default and recommended format")
+        .prompt()?;
+
+    let format = match selection.split_whitespace().next().unwrap_or("toml") {
+        "plist" => OutputFormat::Plist,
+        "json" => OutputFormat::Json,
+        "yaml" => OutputFormat::Yaml,
+        _ => OutputFormat::Toml,
+    };
+
+    Ok(format)
+}
 
 /// Create a new package project
 pub fn create_project(project_dir: &Path, format: OutputFormat, force: bool) -> Result<()> {

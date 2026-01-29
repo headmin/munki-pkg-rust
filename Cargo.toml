@@ -1,6 +1,6 @@
 [package]
 name = "munkipkg"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A modern Rust port of munki-pkg - builds macOS installer packages"
 authors = ["Original concept by Greg Neagle (munki-pkg)", "Rust port by Henry Stamerjohann"]
@@ -23,6 +23,7 @@ walkdir = "2.5"
 tempfile = "3.20"
 regex-lite = "0.1"
 libc = "0.2"
+inquire = "0.7"
 
 [profile.release]
 lto = true

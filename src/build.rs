@@ -23,7 +23,7 @@ use tempfile::TempDir;
 use walkdir::WalkDir;
 
 /// Load environment variables from a .env file
-fn load_env_file(project_dir: &Path, quiet: bool) -> Result<()> {
+pub fn load_env_file(project_dir: &Path, quiet: bool) -> Result<()> {
     // Try project_dir/.env first, then project_dir/../.env
     let env_paths = [
         project_dir.join(".env"),
@@ -431,7 +431,7 @@ fn make_scripts_executable(scripts_dir: &Path) -> Result<()> {
 }
 
 /// Resolve a value that might be an op:// URL, @keychain:, or @env: reference
-fn resolve_secret(value: Option<&str>, quiet: bool) -> Result<Option<String>> {
+pub fn resolve_secret(value: Option<&str>, quiet: bool) -> Result<Option<String>> {
     let Some(val) = value else {
         return Ok(None);
     };
@@ -469,7 +469,7 @@ fn resolve_secret(value: Option<&str>, quiet: bool) -> Result<Option<String>> {
 }
 
 /// Notarize a package
-fn notarize_package(
+pub fn notarize_package(
     pkg_path: &Path,
     info: &crate::config::NotarizationInfo,
     skip_stapling: bool,

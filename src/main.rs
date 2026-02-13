@@ -11,7 +11,10 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod build;
+mod bundle;
+mod bundle_project;
 mod config;
+mod distribution;
 mod external;
 mod import;
 mod project;
@@ -19,6 +22,8 @@ mod signing;
 mod sync;
 
 use build::build_package;
+use bundle::build_bundle;
+use bundle_project::create_bundle_project;
 use config::OutputFormat;
 use import::import_package;
 use project::{create_project, select_format_interactive};
@@ -139,6 +144,55 @@ enum Commands {
         /// Project directory containing Bom.txt
         project_dir: PathBuf,
     },
+
+    /// Build or create multi-component distribution bundles
+    Bundle {
+        #[command(subcommand)]
+        action: BundleAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum BundleAction {
+    /// Build a distribution bundle from component packages
+    Build {
+        /// Bundle project directory containing bundle-info and components/
+        bundle_dir: PathBuf,
+
+        /// Suppress output messages
+        #[arg(short, long)]
+        quiet: bool,
+
+        /// Skip package signing
+        #[arg(long)]
+        skip_signing: bool,
+
+        /// Skip notarization
+        #[arg(long)]
+        skip_notarization: bool,
+
+        /// Skip stapling after notarization
+        #[arg(long)]
+        skip_stapling: bool,
+
+        /// Configure signing/notarization before building
+        #[arg(long)]
+        configure: bool,
+    },
+
+    /// Create a new bundle project
+    Create {
+        /// Path for new bundle directory
+        bundle_dir: PathBuf,
+
+        /// Output format for bundle-info file
+        #[arg(long, value_enum)]
+        format: Option<OutputFormat>,
+
+        /// Overwrite existing bundle project
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -194,6 +248,41 @@ fn main() -> Result<()> {
         }) => import_package(&pkg_path, &project_dir, format),
 
         Some(Commands::Sync { project_dir }) => sync_from_bom(&project_dir),
+
+        Some(Commands::Bundle { action }) => match action {
+            BundleAction::Build {
+                bundle_dir,
+                quiet,
+                skip_signing,
+                skip_notarization,
+                skip_stapling,
+                configure,
+            } => {
+                if configure {
+                    // TODO: bundle-level signing wizard (reuse signing.rs)
+                    eprintln!("Bundle-level --configure not yet implemented. Configure signing in bundle-info directly.");
+                }
+                build_bundle(
+                    &bundle_dir,
+                    quiet,
+                    skip_signing,
+                    skip_notarization,
+                    skip_stapling,
+                )
+            }
+
+            BundleAction::Create {
+                bundle_dir,
+                format,
+                force,
+            } => {
+                let format = match format {
+                    Some(f) => f,
+                    None => select_format_interactive()?,
+                };
+                create_bundle_project(&bundle_dir, format, force)
+            }
+        },
 
         None => {
             if let Some(project_dir) = cli.project_dir {

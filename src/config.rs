@@ -30,6 +30,15 @@ impl OutputFormat {
             OutputFormat::Toml => "build-info.toml",
         }
     }
+
+    pub fn bundle_filename(&self) -> &'static str {
+        match self {
+            OutputFormat::Plist => "bundle-info.plist",
+            OutputFormat::Json => "bundle-info.json",
+            OutputFormat::Yaml => "bundle-info.yaml",
+            OutputFormat::Toml => "bundle-info.toml",
+        }
+    }
 }
 
 /// File ownership options for pkgbuild
@@ -382,9 +391,147 @@ impl BuildInfo {
     }
 }
 
+/// A component reference within a bundle
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentRef {
+    /// Component name — maps to components/{name}/ sub-project
+    pub name: String,
+}
+
+/// Bundle configuration for multi-component distribution packages
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundleInfo {
+    /// Bundle output name (supports ${version} placeholder)
+    pub name: String,
+
+    /// Bundle version string
+    #[serde(default = "default_version")]
+    pub version: String,
+
+    /// Bundle identifier
+    pub identifier: String,
+
+    /// Minimum macOS version required
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_os_version: Option<String>,
+
+    /// Root install location (default "/")
+    #[serde(default = "default_install_location")]
+    pub install_location: String,
+
+    /// Components to include, built in order listed
+    pub components: Vec<ComponentRef>,
+
+    /// Signing configuration (applied to the distribution pkg)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_info: Option<SigningInfo>,
+
+    /// Notarization configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notarization_info: Option<NotarizationInfo>,
+}
+
+impl BundleInfo {
+    /// Get the resolved bundle name (with version substituted)
+    pub fn resolved_name(&self) -> String {
+        self.name.replace("${version}", &self.version)
+    }
+
+    /// Load bundle info from a bundle project directory
+    /// Tries formats in order: plist > json > yaml > toml
+    pub fn load(bundle_dir: &Path) -> Result<Self> {
+        let formats = [
+            ("bundle-info.plist", "plist"),
+            ("bundle-info.json", "json"),
+            ("bundle-info.yaml", "yaml"),
+            ("bundle-info.toml", "toml"),
+        ];
+
+        for (filename, format) in formats {
+            let path = bundle_dir.join(filename);
+            if path.exists() {
+                return Self::load_file(&path, format);
+            }
+        }
+
+        bail!(
+            "No bundle-info file found in {}. Expected one of: bundle-info.plist, bundle-info.json, bundle-info.yaml, or bundle-info.toml",
+            bundle_dir.display()
+        );
+    }
+
+    fn load_file(path: &Path, format: &str) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+
+        let info: BundleInfo = match format {
+            "plist" => {
+                let bytes =
+                    fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+                plist::from_bytes(&bytes)
+                    .with_context(|| format!("Failed to parse plist: {}", path.display()))?
+            }
+            "json" => serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse JSON: {}", path.display()))?,
+            "yaml" => yaml_serde::from_str(&content)
+                .with_context(|| format!("Failed to parse YAML: {}", path.display()))?,
+            "toml" => toml::from_str(&content)
+                .with_context(|| format!("Failed to parse TOML: {}", path.display()))?,
+            _ => bail!("Unknown format: {}", format),
+        };
+
+        Ok(info)
+    }
+
+    /// Save bundle info to a file in the specified format
+    pub fn save(&self, bundle_dir: &Path, format: OutputFormat) -> Result<()> {
+        let filename = format.bundle_filename();
+        let path = bundle_dir.join(filename);
+
+        let content = match format {
+            OutputFormat::Plist => {
+                let mut buf = Vec::new();
+                plist::to_writer_xml(&mut buf, self).context("Failed to serialize to plist")?;
+                fs::write(&path, buf)
+                    .with_context(|| format!("Failed to write {}", path.display()))?;
+                return Ok(());
+            }
+            OutputFormat::Json => {
+                serde_json::to_string_pretty(self).context("Failed to serialize to JSON")?
+            }
+            OutputFormat::Yaml => {
+                yaml_serde::to_string(self).context("Failed to serialize to YAML")?
+            }
+            OutputFormat::Toml => {
+                toml::to_string_pretty(self).context("Failed to serialize to TOML")?
+            }
+        };
+
+        fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Validate the bundle configuration
+    pub fn validate(&self) -> Result<()> {
+        if self.identifier.is_empty() {
+            bail!("Bundle identifier is required");
+        }
+        if self.components.is_empty() {
+            bail!("Bundle must have at least one component");
+        }
+        for comp in &self.components {
+            if comp.name.is_empty() {
+                bail!("Component name cannot be empty");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_default_build_info() {
@@ -414,5 +561,75 @@ mod tests {
         assert_eq!(Ownership::Recommended.as_str(), "recommended");
         assert_eq!(Ownership::Preserve.as_str(), "preserve");
         assert_eq!(Ownership::PreserveOther.as_str(), "preserve-other");
+    }
+
+    #[test]
+    fn test_bundle_info_resolved_name() {
+        let info = BundleInfo {
+            name: "my-bundle-${version}.pkg".to_string(),
+            version: "2.0.0".to_string(),
+            identifier: "com.example.bundle".to_string(),
+            min_os_version: Some("14.0".to_string()),
+            install_location: "/".to_string(),
+            components: vec![ComponentRef { name: "app".to_string() }],
+            signing_info: None,
+            notarization_info: None,
+        };
+        assert_eq!(info.resolved_name(), "my-bundle-2.0.0.pkg");
+    }
+
+    #[test]
+    fn test_bundle_info_validate() {
+        let valid = BundleInfo {
+            name: "test.pkg".to_string(),
+            version: "1.0".to_string(),
+            identifier: "com.example.test".to_string(),
+            min_os_version: None,
+            install_location: "/".to_string(),
+            components: vec![ComponentRef { name: "a".to_string() }],
+            signing_info: None,
+            notarization_info: None,
+        };
+        assert!(valid.validate().is_ok());
+
+        let no_id = BundleInfo {
+            identifier: String::new(),
+            ..valid.clone()
+        };
+        assert!(no_id.validate().is_err());
+
+        let no_components = BundleInfo {
+            components: vec![],
+            ..valid.clone()
+        };
+        assert!(no_components.validate().is_err());
+    }
+
+    #[test]
+    fn test_bundle_info_roundtrip_toml() {
+        let info = BundleInfo {
+            name: "test-${version}.pkg".to_string(),
+            version: "1.0.0".to_string(),
+            identifier: "com.example.bundle".to_string(),
+            min_os_version: Some("14.0".to_string()),
+            install_location: "/".to_string(),
+            components: vec![
+                ComponentRef { name: "dialog".to_string() },
+                ComponentRef { name: "cli".to_string() },
+            ],
+            signing_info: None,
+            notarization_info: None,
+        };
+
+        let temp = TempDir::new().unwrap();
+        info.save(temp.path(), OutputFormat::Toml).unwrap();
+
+        let loaded = BundleInfo::load(temp.path()).unwrap();
+        assert_eq!(loaded.name, info.name);
+        assert_eq!(loaded.version, info.version);
+        assert_eq!(loaded.identifier, info.identifier);
+        assert_eq!(loaded.components.len(), 2);
+        assert_eq!(loaded.components[0].name, "dialog");
+        assert_eq!(loaded.components[1].name, "cli");
     }
 }

@@ -170,6 +170,23 @@ pub fn stapler_staple(pkg_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Build a distribution package from a distribution.xml and component packages
+pub fn productbuild_distribution(
+    distribution_xml: &Path,
+    package_path: &Path,
+    output: &Path,
+) -> Result<()> {
+    let mut cmd = Command::new(PRODUCTBUILD);
+    cmd.arg("--distribution")
+        .arg(distribution_xml)
+        .arg("--package-path")
+        .arg(package_path)
+        .arg(output);
+
+    run_command_checked(&mut cmd)?;
+    Ok(())
+}
+
 /// Sign a package using productsign
 pub fn productsign(
     input_pkg: &Path,

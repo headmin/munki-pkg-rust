@@ -28,6 +28,12 @@ pub const XCRUN: &str = "/usr/bin/xcrun";
 /// Path to macOS productsign command
 pub const PRODUCTSIGN: &str = "/usr/bin/productsign";
 
+/// Path to macOS spctl command (Gatekeeper assessment)
+pub const SPCTL: &str = "/usr/sbin/spctl";
+
+/// Path to git, used to record provenance metadata
+pub const GIT: &str = "/usr/bin/git";
+
 /// Execute a command and return the output
 pub fn run_command(cmd: &mut Command) -> Result<Output> {
     let output = cmd
@@ -123,43 +129,63 @@ pub fn ditto_copy(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Submit package for notarization using notarytool
-pub fn notarytool_submit(
-    pkg_path: &Path,
-    apple_id: Option<&str>,
-    password: Option<&str>,
-    team_id: Option<&str>,
-    api_key_path: Option<&str>,
-    api_key_id: Option<&str>,
-    api_issuer_id: Option<&str>,
-) -> Result<String> {
+/// Submit package for notarization using notarytool.
+///
+/// `auth_args` are the already-resolved authentication arguments — a keychain
+/// profile, an Apple ID triple, or an API key. See
+/// [`crate::config::NotarizationAuth`].
+pub fn notarytool_submit(pkg_path: &Path, auth_args: &[String]) -> Result<String> {
     let mut cmd = Command::new(XCRUN);
     cmd.arg("notarytool").arg("submit").arg(pkg_path);
-
-    if let Some(id) = apple_id {
-        cmd.arg("--apple-id").arg(id);
-    }
-    if let Some(pwd) = password {
-        cmd.arg("--password").arg(pwd);
-    }
-    if let Some(team) = team_id {
-        cmd.arg("--team-id").arg(team);
-    }
-    if let Some(key_path) = api_key_path {
-        cmd.arg("--key").arg(key_path);
-    }
-    if let Some(key_id) = api_key_id {
-        cmd.arg("--key-id").arg(key_id);
-    }
-    if let Some(issuer) = api_issuer_id {
-        cmd.arg("--issuer").arg(issuer);
-    }
-
+    cmd.args(auth_args);
     cmd.arg("--wait").arg("--output-format").arg("json");
 
     let output = run_command_checked(&mut cmd)?;
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
+
+/// Store notarization credentials in the login keychain as a named profile.
+///
+/// Runs `xcrun notarytool store-credentials` with inherited stdio so notarytool
+/// prompts for the app-specific password itself. The password goes straight
+/// from the operator to Apple's tool — munkipkg never reads, stores, or logs it.
+pub fn notarytool_store_credentials(profile: &str, apple_id: &str, team_id: &str) -> Result<()> {
+    let status = Command::new(XCRUN)
+        .arg("notarytool")
+        .arg("store-credentials")
+        .arg(profile)
+        .arg("--apple-id")
+        .arg(apple_id)
+        .arg("--team-id")
+        .arg(team_id)
+        .status()
+        .context("Failed to run 'xcrun notarytool store-credentials'")?;
+
+    if !status.success() {
+        bail!(
+            "notarytool store-credentials failed with exit code {:?}",
+            status.code()
+        );
+    }
+
+    Ok(())
+}
+
+/// Check whether a notarytool keychain profile exists locally.
+///
+/// notarytool stores profiles as generic keychain items under its own service
+/// name, so this is a local lookup with no network round trip.
+pub fn notarytool_profile_exists(profile: &str) -> bool {
+    Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", NOTARY_KEYCHAIN_SERVICE, "-a"])
+        .arg(profile)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Keychain service name notarytool files its stored profiles under.
+const NOTARY_KEYCHAIN_SERVICE: &str = "com.apple.gke.notary.tool";
 
 /// Staple notarization ticket to package
 pub fn stapler_staple(pkg_path: &Path) -> Result<()> {

@@ -4,6 +4,7 @@
 //! signing and notarization settings for projects.
 
 use crate::config::{BuildInfo, NotarizationInfo, OutputFormat, SigningInfo};
+use crate::external;
 use anyhow::{Context, Result, bail};
 use inquire::{Confirm, Select, Text};
 use std::path::Path;
@@ -73,58 +74,56 @@ pub fn configure_signing_interactive(project_dir: &Path) -> Result<()> {
     let has_signing = build_info.signing_info.is_some();
     let has_notarization = build_info.notarization_info.is_some();
 
-    let (configure_app, configure_installer, configure_notarization) = if has_signing || has_notarization {
-        // Show current configuration
-        if let Some(ref signing) = build_info.signing_info {
-            println!("Current signing configuration:");
-            println!("  Application: {}", signing.identity);
-            if let Some(ref inst) = signing.installer_identity {
-                println!("  Installer:   {}", inst);
-            } else {
-                println!("  Installer:   (not configured)");
+    let (configure_app, configure_installer, configure_notarization) =
+        if has_signing || has_notarization {
+            // Show current configuration
+            if let Some(ref signing) = build_info.signing_info {
+                println!("Current signing configuration:");
+                println!("  Application: {}", signing.identity);
+                if let Some(ref inst) = signing.installer_identity {
+                    println!("  Installer:   {}", inst);
+                } else {
+                    println!("  Installer:   (not configured)");
+                }
             }
-        }
-        if let Some(ref notarization) = build_info.notarization_info {
-            if let Some(ref apple_id) = notarization.apple_id {
-                println!("  Apple ID:    {}", apple_id);
+            if let Some(ref notarization) = build_info.notarization_info {
+                if let Some(ref apple_id) = notarization.apple_id {
+                    println!("  Apple ID:    {}", apple_id);
+                }
+                if let Some(ref team_id) = notarization.team_id {
+                    println!("  Team ID:     {}", team_id);
+                }
             }
-            if let Some(ref team_id) = notarization.team_id {
-                println!("  Team ID:     {}", team_id);
-            }
-        }
-        println!();
+            println!();
 
-        // Let user choose what to reconfigure
-        let options = vec![
-            "Reconfigure all",
-            "Application identity only (binary signing)",
-            "Installer identity only (pkg signing)",
-            "Notarization only",
-            "Keep current configuration",
-        ];
+            // Let user choose what to reconfigure
+            let options = vec![
+                "Reconfigure all",
+                "Application identity only (binary signing)",
+                "Installer identity only (pkg signing)",
+                "Notarization only",
+                "Keep current configuration",
+            ];
 
-        let selection = Select::new("What would you like to configure?", options).prompt()?;
+            let selection = Select::new("What would you like to configure?", options).prompt()?;
 
-        match selection {
-            "Reconfigure all" => (true, true, true),
-            "Application identity only (binary signing)" => (true, false, false),
-            "Installer identity only (pkg signing)" => (false, true, false),
-            "Notarization only" => (false, false, true),
-            _ => {
-                println!("Keeping existing configuration.");
-                return Ok(());
+            match selection {
+                "Reconfigure all" => (true, true, true),
+                "Application identity only (binary signing)" => (true, false, false),
+                "Installer identity only (pkg signing)" => (false, true, false),
+                "Notarization only" => (false, false, true),
+                _ => {
+                    println!("Keeping existing configuration.");
+                    return Ok(());
+                }
             }
-        }
-    } else {
-        // No existing config, configure everything
-        (true, true, true)
-    };
+        } else {
+            // No existing config, configure everything
+            (true, true, true)
+        };
 
     // Get existing identities for pre-selection
-    let existing_app_identity = build_info
-        .signing_info
-        .as_ref()
-        .map(|s| s.identity.clone());
+    let existing_app_identity = build_info.signing_info.as_ref().map(|s| s.identity.clone());
     let existing_installer_identity = build_info
         .signing_info
         .as_ref()
@@ -179,7 +178,8 @@ pub fn configure_signing_interactive(project_dir: &Path) -> Result<()> {
                 .and_then(|current| installer_identities.iter().position(|id| id == current))
                 .unwrap_or(0);
 
-            let mut inst_options: Vec<&str> = installer_identities.iter().map(|s| s.as_str()).collect();
+            let mut inst_options: Vec<&str> =
+                installer_identities.iter().map(|s| s.as_str()).collect();
             inst_options.push("Skip package signing");
 
             let selection = Select::new("Installer identity (for pkg):", inst_options)
@@ -201,7 +201,9 @@ pub fn configure_signing_interactive(project_dir: &Path) -> Result<()> {
             identity: app_selection,
             installer_identity: installer_selection,
             keychain: existing.as_ref().and_then(|s| s.keychain.clone()),
-            additional_cert_names: existing.as_ref().and_then(|s| s.additional_cert_names.clone()),
+            additional_cert_names: existing
+                .as_ref()
+                .and_then(|s| s.additional_cert_names.clone()),
             timestamp: existing.as_ref().map(|s| s.timestamp).unwrap_or(true),
         };
         build_info.signing_info = Some(signing_info);
@@ -244,7 +246,8 @@ pub fn configure_signing_interactive(project_dir: &Path) -> Result<()> {
 
             match selection {
                 "Update notarization credentials" => {
-                    let notarization_info = configure_notarization_interactive(&build_info.notarization_info)?;
+                    let notarization_info =
+                        configure_notarization_interactive(&build_info.notarization_info)?;
                     build_info.notarization_info = Some(notarization_info);
                 }
                 "Disable notarization (remove config)" => {
@@ -263,7 +266,8 @@ pub fn configure_signing_interactive(project_dir: &Path) -> Result<()> {
                 .prompt()?;
 
             if do_configure {
-                let notarization_info = configure_notarization_interactive(&build_info.notarization_info)?;
+                let notarization_info =
+                    configure_notarization_interactive(&build_info.notarization_info)?;
                 build_info.notarization_info = Some(notarization_info);
             }
         }
@@ -280,9 +284,127 @@ pub fn configure_signing_interactive(project_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Interactively configure notarization settings
-fn configure_notarization_interactive(existing: &Option<NotarizationInfo>) -> Result<NotarizationInfo> {
-    println!("Enter your Apple Developer account details.");
+/// Interactively configure notarization settings.
+///
+/// Offers three authentication methods, keychain profile first: it is the only
+/// one that keeps credentials out of build-info, out of the environment, and
+/// out of this process.
+fn configure_notarization_interactive(
+    existing: &Option<NotarizationInfo>,
+) -> Result<NotarizationInfo> {
+    let methods = vec![
+        "Keychain profile (recommended) - credentials stay in your login keychain",
+        "Apple ID + app-specific password - supports op://, @env:, @keychain:",
+        "App Store Connect API key",
+    ];
+
+    let selection = Select::new("How should notarization authenticate?", methods)
+        .with_help_message(
+            "A keychain profile is created once per machine and reused by every project",
+        )
+        .prompt()?;
+
+    let base = |info: NotarizationInfo| NotarizationInfo {
+        staple_timeout: existing.as_ref().map(|n| n.staple_timeout).unwrap_or(300),
+        asc_provider: existing.as_ref().and_then(|n| n.asc_provider.clone()),
+        primary_bundle_id: existing.as_ref().and_then(|n| n.primary_bundle_id.clone()),
+        ..info
+    };
+
+    if selection.starts_with("Keychain profile") {
+        return Ok(base(configure_keychain_profile(existing)?));
+    }
+
+    if selection.starts_with("App Store Connect") {
+        return Ok(base(configure_api_key(existing)?));
+    }
+
+    Ok(base(configure_apple_id(existing)?))
+}
+
+/// Configure — and if needed create — a notarytool keychain profile.
+///
+/// Credentials are stored once with `xcrun notarytool store-credentials`, and
+/// afterwards build-info only names the profile. Nothing secret is written to
+/// the project, and no environment variables are needed at build time.
+fn configure_keychain_profile(existing: &Option<NotarizationInfo>) -> Result<NotarizationInfo> {
+    println!("\nA keychain profile stores your Apple ID, Team ID and app-specific");
+    println!("password in the login keychain under a name you choose. build-info");
+    println!("records only that name.\n");
+
+    let default_profile = existing
+        .as_ref()
+        .and_then(|n| n.keychain_profile.clone())
+        .unwrap_or_else(|| "AC_PASSWORD".to_string());
+
+    let profile = Text::new("Keychain profile name:")
+        .with_help_message("The label you passed, or will pass, to notarytool store-credentials")
+        .with_default(&default_profile)
+        .prompt()?;
+
+    if external::notarytool_profile_exists(&profile) {
+        println!("Found existing keychain profile \"{}\".", profile);
+    } else {
+        println!("\nNo keychain profile named \"{}\" was found.", profile);
+
+        let create = Confirm::new("Create it now?")
+            .with_help_message("Runs 'xcrun notarytool store-credentials'; notarytool asks for the password itself")
+            .with_default(true)
+            .prompt()?;
+
+        if create {
+            store_credentials_interactive(&profile, existing)?;
+        } else {
+            println!("\nCreate it later with:\n");
+            println!("  xcrun notarytool store-credentials \"{}\" \\", profile);
+            println!("      --apple-id \"you@example.com\" \\");
+            println!("      --team-id \"YOURTEAMID\" \\");
+            println!("      --password \"abcd-efgh-ijkl-mnop\"\n");
+        }
+    }
+
+    Ok(NotarizationInfo {
+        keychain_profile: Some(profile),
+        ..Default::default()
+    })
+}
+
+/// Run `notarytool store-credentials` with inherited stdio.
+///
+/// The app-specific password is typed straight into notarytool's own prompt —
+/// munkipkg never reads, stores, or logs it.
+fn store_credentials_interactive(profile: &str, existing: &Option<NotarizationInfo>) -> Result<()> {
+    let default_apple_id = existing
+        .as_ref()
+        .and_then(|n| n.apple_id.clone())
+        .unwrap_or_default();
+    let default_team_id = existing
+        .as_ref()
+        .and_then(|n| n.team_id.clone())
+        .unwrap_or_default();
+
+    let apple_id = Text::new("Apple ID:")
+        .with_help_message("The Apple ID email for your Developer account")
+        .with_default(&default_apple_id)
+        .prompt()?;
+
+    let team_id = Text::new("Team ID:")
+        .with_help_message("Ten characters, e.g. ABC123DEF4")
+        .with_default(&default_team_id)
+        .prompt()?;
+
+    println!("\nnotarytool will now prompt for your app-specific password.");
+    println!("Create one at https://appleid.apple.com under App-Specific Passwords.\n");
+
+    external::notarytool_store_credentials(profile, &apple_id, &team_id)?;
+    println!("\nStored keychain profile \"{}\".", profile);
+
+    Ok(())
+}
+
+/// Configure Apple ID authentication, with secret-reference support.
+fn configure_apple_id(existing: &Option<NotarizationInfo>) -> Result<NotarizationInfo> {
+    println!("\nEnter your Apple Developer account details.");
     println!("Supports: op://... (1Password), @env:VAR, @keychain:ITEM\n");
     println!("Tip: Create a .env file in your project with credentials.\n");
 
@@ -325,12 +447,47 @@ fn configure_notarization_interactive(existing: &Option<NotarizationInfo>) -> Re
         apple_id: Some(apple_id),
         password: Some(password),
         team_id: Some(team_id),
-        asc_provider: existing.as_ref().and_then(|n| n.asc_provider.clone()),
-        primary_bundle_id: existing.as_ref().and_then(|n| n.primary_bundle_id.clone()),
-        staple_timeout: existing.as_ref().map(|n| n.staple_timeout).unwrap_or(300),
-        api_key_path: existing.as_ref().and_then(|n| n.api_key_path.clone()),
-        api_key_id: existing.as_ref().and_then(|n| n.api_key_id.clone()),
-        api_issuer_id: existing.as_ref().and_then(|n| n.api_issuer_id.clone()),
+        ..Default::default()
+    })
+}
+
+/// Configure App Store Connect API key authentication.
+fn configure_api_key(existing: &Option<NotarizationInfo>) -> Result<NotarizationInfo> {
+    println!("\nEnter your App Store Connect API key details.\n");
+
+    let key_path = Text::new("API key file (.p8) path:")
+        .with_help_message("e.g. ~/private_keys/AuthKey_ABC123DEF4.p8")
+        .with_default(
+            &existing
+                .as_ref()
+                .and_then(|n| n.api_key_path.clone())
+                .unwrap_or_default(),
+        )
+        .prompt()?;
+
+    let key_id = Text::new("Key ID:")
+        .with_default(
+            &existing
+                .as_ref()
+                .and_then(|n| n.api_key_id.clone())
+                .unwrap_or_default(),
+        )
+        .prompt()?;
+
+    let issuer_id = Text::new("Issuer ID:")
+        .with_default(
+            &existing
+                .as_ref()
+                .and_then(|n| n.api_issuer_id.clone())
+                .unwrap_or_default(),
+        )
+        .prompt()?;
+
+    Ok(NotarizationInfo {
+        api_key_path: Some(key_path),
+        api_key_id: Some(key_id),
+        api_issuer_id: Some(issuer_id),
+        ..Default::default()
     })
 }
 

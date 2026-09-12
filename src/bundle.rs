@@ -3,11 +3,11 @@
 //! Orchestrates building multiple munkipkg sub-projects into a single
 //! signed and notarized distribution package using `productbuild --distribution`.
 
-use crate::build::{build_package, load_env_file, notarize_package};
+use crate::build::{BuildOptions, build_package, load_env_file, notarize_package};
 use crate::bundle_project::validate_bundle_project;
-use crate::config::{BundleInfo, BuildInfo};
+use crate::config::{BuildInfo, BundleInfo};
 use crate::distribution::{ComponentPackage, generate_distribution_xml};
-use crate::external::{self, productsign, productbuild_distribution};
+use crate::external::{self, productbuild_distribution, productsign};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -69,13 +69,17 @@ pub fn build_bundle(
         }
 
         // Build component (skip signing/notarization — handled at bundle level)
+        // Components are built bare: the bundle is signed and notarized as
+        // a whole, so a component signature would only be replaced.
         build_package(
             &project_dir,
-            false, // export_bom
-            quiet,
-            true,  // skip_signing (always — sign at bundle level)
-            true,  // skip_notarization (always — notarize at bundle level)
-            true,  // skip_stapling
+            &BuildOptions {
+                quiet,
+                skip_signing: true,
+                skip_notarization: true,
+                skip_stapling: true,
+                ..Default::default()
+            },
         )?;
 
         // Load component's build-info to get identifier, version, pkg name
@@ -113,12 +117,8 @@ pub fn build_bundle(
     for pkg_path in &built_pkg_paths {
         let filename = pkg_path.file_name().unwrap();
         let dest = packages_dir.join(filename);
-        fs::copy(pkg_path, &dest).with_context(|| {
-            format!(
-                "Failed to copy {} to staging area",
-                pkg_path.display()
-            )
-        })?;
+        fs::copy(pkg_path, &dest)
+            .with_context(|| format!("Failed to copy {} to staging area", pkg_path.display()))?;
     }
 
     // Generate distribution.xml
@@ -201,7 +201,11 @@ pub fn build_bundle(
         println!(
             "Contains {} component{}:",
             component_packages.len(),
-            if component_packages.len() == 1 { "" } else { "s" }
+            if component_packages.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
         );
         for comp in &component_packages {
             println!("  - {} ({} v{})", comp.name, comp.identifier, comp.version);

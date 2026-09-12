@@ -32,8 +32,13 @@ pub fn generate_distribution_xml(
 
     xml.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
     xml.push_str("<installer-gui-script minSpecVersion=\"2\">\n");
-    xml.push_str(&format!("    <title>{}</title>\n", escape_xml(&bundle_info.name)));
-    xml.push_str("    <options customize=\"never\" require-scripts=\"false\" rootVolumeOnly=\"true\"/>\n");
+    xml.push_str(&format!(
+        "    <title>{}</title>\n",
+        escape_xml(&bundle_info.name)
+    ));
+    xml.push_str(
+        "    <options customize=\"never\" require-scripts=\"false\" rootVolumeOnly=\"true\"/>\n",
+    );
 
     // Volume check for minimum OS version
     if let Some(ref min_os) = bundle_info.min_os_version {
@@ -50,7 +55,10 @@ pub fn generate_distribution_xml(
     // Choices outline — defines install order
     xml.push_str("    <choices-outline>\n");
     for comp in components {
-        xml.push_str(&format!("        <line choice=\"{}\"/>\n", escape_xml(&comp.name)));
+        xml.push_str(&format!(
+            "        <line choice=\"{}\"/>\n",
+            escape_xml(&comp.name)
+        ));
     }
     xml.push_str("    </choices-outline>\n");
 
@@ -99,8 +107,12 @@ mod tests {
             min_os_version: Some("14.0".to_string()),
             install_location: "/".to_string(),
             components: vec![
-                ComponentRef { name: "dialog".to_string() },
-                ComponentRef { name: "cli".to_string() },
+                ComponentRef {
+                    name: "dialog".to_string(),
+                },
+                ComponentRef {
+                    name: "cli".to_string(),
+                },
             ],
             signing_info: None,
             notarization_info: None,
@@ -132,8 +144,12 @@ mod tests {
         assert!(xml.contains("<line choice=\"cli\"/>"));
         assert!(xml.contains("<choice id=\"dialog\" visible=\"false\">"));
         assert!(xml.contains("<pkg-ref id=\"com.swiftdialog.app\"/>"));
-        assert!(xml.contains("<pkg-ref id=\"com.swiftdialog.app\" version=\"2.5.0\">dialog-2.5.0.pkg</pkg-ref>"));
-        assert!(xml.contains("<pkg-ref id=\"com.ignitecli.pkg\" version=\"1.0.0\">cli-1.0.0.pkg</pkg-ref>"));
+        assert!(xml.contains(
+            "<pkg-ref id=\"com.swiftdialog.app\" version=\"2.5.0\">dialog-2.5.0.pkg</pkg-ref>"
+        ));
+        assert!(xml.contains(
+            "<pkg-ref id=\"com.ignitecli.pkg\" version=\"1.0.0\">cli-1.0.0.pkg</pkg-ref>"
+        ));
     }
 
     #[test]
@@ -144,7 +160,9 @@ mod tests {
             identifier: "com.example.simple".to_string(),
             min_os_version: None,
             install_location: "/".to_string(),
-            components: vec![ComponentRef { name: "app".to_string() }],
+            components: vec![ComponentRef {
+                name: "app".to_string(),
+            }],
             signing_info: None,
             notarization_info: None,
         };

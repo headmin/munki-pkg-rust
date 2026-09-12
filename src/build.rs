@@ -5,7 +5,9 @@
 //!
 //! Original algorithm by Greg Neagle in munki-pkg.
 
-use crate::config::{BuildInfo, PostinstallAction};
+use crate::build_result::BuildResult;
+use crate::config::{BuildInfo, NotarizationAuth, PostinstallAction};
+use crate::errors::{build_failed, invalid_config, notarization_failed, signing_failed};
 use crate::external::{
     self, PKGBUILD, PRODUCTBUILD, ditto_copy, lsbom_extract, productsign, run_command_checked,
     stapler_staple,
@@ -13,7 +15,9 @@ use crate::external::{
 use crate::project::{
     get_payload_dir, get_scripts_dir, has_payload, has_scripts, validate_project,
 };
-use anyhow::{Context, Result, bail};
+use crate::provenance::Provenance;
+use crate::verify::verify_package;
+use anyhow::{Context, Result};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -71,16 +75,40 @@ pub fn load_env_file(project_dir: &Path, quiet: bool) -> Result<()> {
     Ok(())
 }
 
-/// Build a package from a project directory
-#[allow(clippy::too_many_arguments)]
-pub fn build_package(
-    project_dir: &Path,
-    export_bom: bool,
-    quiet: bool,
-    skip_signing: bool,
-    skip_notarization: bool,
-    skip_stapling: bool,
-) -> Result<()> {
+/// Everything that varies between two builds of the same project.
+///
+/// Grouped into a struct rather than passed as a dozen positional booleans,
+/// which is how `skip_signing` and `skip_notarization` end up swapped.
+#[derive(Debug, Clone, Default)]
+pub struct BuildOptions {
+    /// Write `Bom.txt` back to the project after building.
+    pub export_bom: bool,
+    /// Suppress human-readable status output.
+    pub quiet: bool,
+    /// Do not sign, even when `signing_info` is configured.
+    pub skip_signing: bool,
+    /// Do not notarize, even when `notarization_info` is configured.
+    pub skip_notarization: bool,
+    /// Notarize but do not staple the ticket.
+    pub skip_stapling: bool,
+    /// Write a `<pkg>.provenance.json` attestation beside the package.
+    pub provenance: bool,
+    /// Verify the finished package against build-info before reporting success.
+    pub verify: bool,
+    /// Replace the build-info `version`, e.g. from a git tag or CI variable.
+    pub version_override: Option<String>,
+    /// Write the package here instead of the project's `build/` directory.
+    pub output_dir: Option<PathBuf>,
+}
+
+/// Build a package from a project directory.
+///
+/// Returns a [`BuildResult`] describing what was actually produced — its
+/// `signed`, `notarized` and `stapled` flags report what happened, not what
+/// build-info asked for.
+pub fn build_package(project_dir: &Path, options: &BuildOptions) -> Result<BuildResult> {
+    let quiet = options.quiet;
+
     // Validate project structure
     validate_project(project_dir)?;
 
@@ -90,8 +118,9 @@ pub fn build_package(
     // Verify required tools are available
     external::verify_tools()?;
 
-    // Load build info
-    let build_info = BuildInfo::load(project_dir)?;
+    // Load build info, applying --pkg-version and stamping dynamic date tokens
+    // before anything reads the version.
+    let build_info = BuildInfo::load_resolved(project_dir, options.version_override.as_deref())?;
     build_info.validate()?;
 
     if !quiet {
@@ -101,8 +130,11 @@ pub fn build_package(
     // Create temporary working directory
     let temp_dir = TempDir::new().context("Failed to create temporary directory")?;
 
-    // Create build output directory
-    let build_dir = project_dir.join("build");
+    // Create build output directory — the project's build/ unless redirected
+    let build_dir = match &options.output_dir {
+        Some(dir) => dir.clone(),
+        None => project_dir.join("build"),
+    };
     fs::create_dir_all(&build_dir)
         .with_context(|| format!("Failed to create build directory: {}", build_dir.display()))?;
 
@@ -111,7 +143,9 @@ pub fn build_package(
     let has_script_content = has_scripts(project_dir);
 
     if !has_payload_content && !has_script_content {
-        bail!("Project has no payload and no scripts. Nothing to build.");
+        return Err(
+            invalid_config("Project has no payload and no scripts. Nothing to build.").into(),
+        );
     }
 
     // Prepare payload directory (clean .DS_Store files)
@@ -130,6 +164,9 @@ pub fn build_package(
         let scripts_dir = get_scripts_dir(project_dir).unwrap();
         let working = temp_dir.path().join("scripts");
         ditto_copy(&scripts_dir, &working)?;
+        clean_ds_store(&working)?;
+        // Scripts never need xattrs (quarantine, provenance, ...); drop them.
+        run_command_checked(Command::new("/usr/bin/xattr").arg("-cr").arg(&working))?;
         make_scripts_executable(&working)?;
         Some(working)
     } else {
@@ -185,13 +222,15 @@ pub fn build_package(
     let output_pkg = build_dir.join(build_info.resolved_name());
 
     // Sign package if configured and not skipped
+    let mut signed = false;
     if let Some(ref signing_info) = build_info.signing_info {
-        if skip_signing {
+        if options.skip_signing {
             if !quiet {
                 println!("Skipping signing as requested");
             }
             fs::copy(&pre_sign_pkg, &output_pkg)?;
         } else {
+            signed = true;
             // Use installer_identity for pkg signing, or derive from identity
             let pkg_identity = signing_info
                 .installer_identity
@@ -220,7 +259,8 @@ pub fn build_package(
                     &derived,
                     signing_info.keychain.as_deref(),
                     signing_info.timestamp,
-                )?;
+                )
+                .map_err(|error| signing_failed(format!("Failed to sign package: {:#}", error)))?;
             } else {
                 if !quiet {
                     println!("Signing package with identity: {}", pkg_identity);
@@ -231,7 +271,8 @@ pub fn build_package(
                     pkg_identity,
                     signing_info.keychain.as_deref(),
                     signing_info.timestamp,
-                )?;
+                )
+                .map_err(|error| signing_failed(format!("Failed to sign package: {:#}", error)))?;
             }
         }
     } else {
@@ -239,8 +280,10 @@ pub fn build_package(
     }
 
     // Notarize if configured and not skipped
+    let mut notarized = false;
+    let mut stapled = false;
     if let Some(ref notarization_info) = build_info.notarization_info {
-        if skip_notarization {
+        if options.skip_notarization {
             if !quiet {
                 println!("Skipping notarization as requested");
             }
@@ -248,20 +291,64 @@ pub fn build_package(
             if !quiet {
                 println!("Submitting package for notarization...");
             }
-            notarize_package(&output_pkg, notarization_info, skip_stapling, quiet)?;
+            stapled =
+                notarize_package(&output_pkg, notarization_info, options.skip_stapling, quiet)?;
+            notarized = true;
         }
     }
 
     // Export BOM info if requested
-    if export_bom {
+    if options.export_bom {
         export_bom_info(&output_pkg, project_dir, quiet)?;
+    }
+
+    // Verify the finished artifact actually matches what build-info declared.
+    // Runs before the result is reported, so a mismatch fails the build.
+    if options.verify {
+        if !quiet {
+            println!("Verifying package...");
+        }
+        let expected_identifier = if build_info.distribution_style {
+            build_info
+                .product_id
+                .as_deref()
+                .unwrap_or(&build_info.identifier)
+        } else {
+            &build_info.identifier
+        };
+        verify_package(
+            &output_pkg,
+            expected_identifier,
+            &build_info.version,
+            signed,
+            notarized,
+            quiet,
+        )?;
+    }
+
+    let result = BuildResult::new(
+        build_info.resolved_name(),
+        build_info.version.clone(),
+        build_info.identifier.clone(),
+        &output_pkg,
+        signed,
+        notarized,
+        stapled,
+    )?;
+
+    if options.provenance {
+        let provenance = Provenance::build(&build_info, &output_pkg, project_dir)?;
+        let sidecar = provenance.write_sidecar(&output_pkg)?;
+        if !quiet {
+            println!("Wrote provenance: {}", sidecar.display());
+        }
     }
 
     if !quiet {
         println!("\nPackage built successfully: {}", output_pkg.display());
     }
 
-    Ok(())
+    Ok(result)
 }
 
 /// Build the component package using pkgbuild
@@ -448,7 +535,9 @@ pub fn resolve_secret(value: Option<&str>, quiet: bool) -> Result<Option<String>
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to read from 1Password: {}", stderr);
+            return Err(
+                invalid_config(format!("Failed to read from 1Password: {}", stderr)).into(),
+            );
         }
 
         Ok(Some(
@@ -468,41 +557,82 @@ pub fn resolve_secret(value: Option<&str>, quiet: bool) -> Result<Option<String>
     }
 }
 
-/// Notarize a package
+/// Decide how a submission authenticates, resolving any secret references.
+///
+/// A keychain profile wins when set: it is the only method that keeps
+/// credentials out of both build-info and the environment.
+pub fn resolve_notarization_auth(
+    info: &crate::config::NotarizationInfo,
+    quiet: bool,
+) -> Result<NotarizationAuth> {
+    if let Some(profile) = resolve_secret(info.keychain_profile.as_deref(), quiet)? {
+        return Ok(NotarizationAuth::KeychainProfile(profile));
+    }
+
+    let apple_id = resolve_secret(info.apple_id.as_deref(), quiet)?;
+    let password = resolve_secret(info.password.as_deref(), quiet)?;
+    let team_id = resolve_secret(info.team_id.as_deref(), quiet)?;
+    if let (Some(apple_id), Some(password), Some(team_id)) = (apple_id, password, team_id) {
+        return Ok(NotarizationAuth::AppleId {
+            apple_id,
+            password,
+            team_id,
+        });
+    }
+
+    let key_path = resolve_secret(info.api_key_path.as_deref(), quiet)?;
+    let key_id = resolve_secret(info.api_key_id.as_deref(), quiet)?;
+    let issuer_id = resolve_secret(info.api_issuer_id.as_deref(), quiet)?;
+    if let (Some(key_path), Some(key_id), Some(issuer_id)) = (key_path, key_id, issuer_id) {
+        return Ok(NotarizationAuth::ApiKey {
+            key_path,
+            key_id,
+            issuer_id,
+        });
+    }
+
+    Err(invalid_config(
+        "notarization_info has no usable credentials. Set keychain_profile (see \
+         `munkipkg configure`), or apple_id with team_id and password, or an API key.",
+    )
+    .into())
+}
+
+/// Notarize a package. Returns whether the ticket was stapled.
 pub fn notarize_package(
     pkg_path: &Path,
     info: &crate::config::NotarizationInfo,
     skip_stapling: bool,
     quiet: bool,
-) -> Result<()> {
-    // Resolve any op://, @keychain:, or @env: references
-    let apple_id = resolve_secret(info.apple_id.as_deref(), quiet)?;
-    let password = resolve_secret(info.password.as_deref(), quiet)?;
-    let team_id = resolve_secret(info.team_id.as_deref(), quiet)?;
+) -> Result<bool> {
+    let auth = resolve_notarization_auth(info, quiet)?;
 
-    let result = external::notarytool_submit(
-        pkg_path,
-        apple_id.as_deref(),
-        password.as_deref(),
-        team_id.as_deref(),
-        info.api_key_path.as_deref(),
-        info.api_key_id.as_deref(),
-        info.api_issuer_id.as_deref(),
-    )?;
+    if !quiet {
+        println!("Authenticating with {}", auth.description());
+    }
+
+    let result = external::notarytool_submit(pkg_path, &auth.to_args())
+        .map_err(|error| notarization_failed(format!("Notarization upload failed: {:#}", error)))?;
 
     if !quiet {
         println!("Notarization result: {}", result);
     }
 
     // Staple the notarization ticket
-    if !skip_stapling {
+    if skip_stapling {
         if !quiet {
-            println!("Stapling notarization ticket...");
+            println!("Skipping stapling as requested");
         }
-        stapler_staple(pkg_path)?;
+        return Ok(false);
     }
 
-    Ok(())
+    if !quiet {
+        println!("Stapling notarization ticket...");
+    }
+    stapler_staple(pkg_path)
+        .map_err(|error| notarization_failed(format!("Stapling failed: {:#}", error)))?;
+
+    Ok(true)
 }
 
 /// Export BOM info to Bom.txt
@@ -540,7 +670,7 @@ fn find_bom_file(expanded_dir: &Path) -> Result<PathBuf> {
             return Ok(entry.path().to_path_buf());
         }
     }
-    bail!("No Bom file found in expanded package");
+    Err(build_failed("No Bom file found in expanded package").into())
 }
 
 #[cfg(test)]

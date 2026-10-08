@@ -154,6 +154,11 @@ pub fn build_package(project_dir: &Path, options: &BuildOptions) -> Result<Build
         let working = temp_dir.path().join("payload");
         ditto_copy(&payload_dir, &working)?;
         clean_ds_store(&working)?;
+        // Quarantine/provenance must not ship inside the package; opt out
+        // with preserve_xattr.
+        if !build_info.preserve_xattr {
+            clear_xattrs(&working)?;
+        }
         Some(working)
     } else {
         None
@@ -165,8 +170,7 @@ pub fn build_package(project_dir: &Path, options: &BuildOptions) -> Result<Build
         let working = temp_dir.path().join("scripts");
         ditto_copy(&scripts_dir, &working)?;
         clean_ds_store(&working)?;
-        // Scripts never need xattrs (quarantine, provenance, ...); drop them.
-        run_command_checked(Command::new("/usr/bin/xattr").arg("-cr").arg(&working))?;
+        clear_xattrs(&working)?;
         make_scripts_executable(&working)?;
         Some(working)
     } else {
@@ -490,6 +494,12 @@ fn suppress_bundle_relocation(plist_path: &Path) -> Result<()> {
 
     let mut file = File::create(plist_path)?;
     plist::to_writer_xml(&mut file, &components)?;
+    Ok(())
+}
+
+/// Recursively clear extended attributes (quarantine, provenance, ...)
+fn clear_xattrs(dir: &Path) -> Result<()> {
+    run_command_checked(Command::new("/usr/bin/xattr").arg("-cr").arg(dir))?;
     Ok(())
 }
 

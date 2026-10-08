@@ -123,9 +123,9 @@ When more than one is configured, the keychain profile wins.
 
 `.DS_Store` files are removed from both `payload/` and `scripts/` on every
 build, in a temporary copy, so your project directory is never touched. Extended
-attributes (quarantine, provenance) are stripped from `scripts/` as well. The
-payload's xattrs are left as they are; `preserve_xattr = true` passes
-`--preserve-xattr` to `pkgbuild`.
+attributes (quarantine, provenance) are cleared recursively from both, which
+matters most for downloaded apps and binaries. Set `preserve_xattr = true` to
+keep the payload's xattrs; it also passes `--preserve-xattr` to `pkgbuild`.
 
 ### Reconfigure signing/notarization
 

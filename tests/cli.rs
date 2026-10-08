@@ -536,6 +536,43 @@ mod building {
     }
 
     #[test]
+    fn test_payload_xattrs_are_cleared_unless_preserved() {
+        for (preserve, expect_xattr) in [(false, false), (true, true)] {
+            let info = format!("{}preserve_xattr = {preserve}\n", default_build_info());
+            let temp = fixture(&info);
+            let project = project_path(&temp);
+            let file = project.join("payload/usr/local/share/hello.txt");
+            let set = Command::new("/usr/bin/xattr")
+                .args(["-w", "com.apple.quarantine", "0081;00000000;test;"])
+                .arg(&file)
+                .output()
+                .unwrap();
+            assert!(set.status.success(), "{}", stderr(&set));
+
+            let output = munkipkg(&[project.to_str().unwrap(), "--quiet"]);
+            assert_eq!(status(&output), 0, "stderr: {}", stderr(&output));
+
+            let expanded = temp.path().join("expanded");
+            Command::new("/usr/sbin/pkgutil")
+                .arg("--expand-full")
+                .arg(project.join("build/mypackage-1.0.pkg"))
+                .arg(&expanded)
+                .output()
+                .unwrap();
+            let listing = Command::new("/usr/bin/xattr")
+                .arg("-lr")
+                .arg(&expanded)
+                .output()
+                .unwrap();
+            assert_eq!(
+                stdout(&listing).contains("com.apple.quarantine"),
+                expect_xattr,
+                "preserve_xattr = {preserve}"
+            );
+        }
+    }
+
+    #[test]
     fn test_distribution_style_package_verifies() {
         let temp = fixture(
             "name = \"mypackage-${version}.pkg\"\n\

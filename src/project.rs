@@ -4,7 +4,7 @@
 //! the standard structure and default configuration files.
 
 use crate::config::{BuildInfo, OutputFormat};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use inquire::Select;
 use std::fs;
 use std::path::Path;
@@ -49,10 +49,11 @@ pub fn create_project(project_dir: &Path, format: OutputFormat, force: bool) -> 
             fs::remove_dir_all(project_dir)
                 .with_context(|| format!("Failed to remove {}", project_dir.display()))?;
         } else {
-            bail!(
+            return Err(crate::errors::project_exists(format!(
                 "Project directory already exists: {}. Use --force to overwrite.",
                 project_dir.display()
-            );
+            ))
+            .into());
         }
     }
 
@@ -103,14 +104,19 @@ pub fn create_project(project_dir: &Path, format: OutputFormat, force: bool) -> 
 /// Validate a project directory structure
 pub fn validate_project(project_dir: &Path) -> Result<()> {
     if !project_dir.exists() {
-        bail!(
+        return Err(crate::errors::invalid_config(format!(
             "Project directory does not exist: {}",
             project_dir.display()
-        );
+        ))
+        .into());
     }
 
     if !project_dir.is_dir() {
-        bail!("Not a directory: {}", project_dir.display());
+        return Err(crate::errors::invalid_config(format!(
+            "Not a directory: {}",
+            project_dir.display()
+        ))
+        .into());
     }
 
     // Check for build-info file (any format)
@@ -126,11 +132,12 @@ pub fn validate_project(project_dir: &Path) -> Result<()> {
         .any(|f| project_dir.join(f).exists());
 
     if !has_build_info {
-        bail!(
+        return Err(crate::errors::invalid_config(format!(
             "No build-info file found in {}. Expected one of: {}",
             project_dir.display(),
             build_info_files.join(", ")
-        );
+        ))
+        .into());
     }
 
     Ok(())

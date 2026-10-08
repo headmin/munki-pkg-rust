@@ -7,7 +7,7 @@
 use crate::config::{BuildInfo, OutputFormat};
 use crate::external::{ditto_extract, lsbom_extract, pkgutil_expand};
 use crate::sync::apply_bom_to_payload;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -25,15 +25,20 @@ build/
 pub fn import_package(pkg_path: &Path, project_dir: &Path, format: OutputFormat) -> Result<()> {
     // Validate package exists
     if !pkg_path.exists() {
-        bail!("Package not found: {}", pkg_path.display());
+        return Err(crate::errors::import_failed(format!(
+            "Package not found: {}",
+            pkg_path.display()
+        ))
+        .into());
     }
 
     // Check if project directory already exists
     if project_dir.exists() {
-        bail!(
+        return Err(crate::errors::project_exists(format!(
             "Project directory already exists: {}",
             project_dir.display()
-        );
+        ))
+        .into());
     }
 
     println!("Importing package: {}", pkg_path.display());

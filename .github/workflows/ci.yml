@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test on macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --verbose
+
+      # Unit tests plus the end-to-end suite, which drives the real binary
+      # against Apple's pkgbuild on the macOS runner.
+      - name: Test
+        run: cargo test --verbose
+
+  # A real project built by the freshly compiled binary, then inspected with
+  # Apple's own tools. Catches breakage that unit tests cannot see: a malformed
+  # package, a manifest that disagrees with the artifact, a broken sidecar.
+  smoke:
+    name: End-to-end package build
+    runs-on: macos-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Create a project
+        run: |
+          ./target/release/munkipkg create /tmp/smoke --format toml
+          mkdir -p /tmp/smoke/payload/usr/local/share
+          echo "smoke test payload" > /tmp/smoke/payload/usr/local/share/smoke.txt
+
+      - name: Lint the project
+        run: ./target/release/munkipkg lint /tmp/smoke --strict
+
+      - name: Build, verify, and attest
+        run: |
+          ./target/release/munkipkg /tmp/smoke \
+            --pkg-version "1.2.3" \
+            --output-dir /tmp/smoke-dist \
+            --provenance \
+            --verify \
+            --output-format json | tee /tmp/manifest.json
+
+      - name: Check the manifest against the artifact
+        run: |
+          set -euo pipefail
+
+          PKG=$(jq -r .pkg_path /tmp/manifest.json)
+          VERSION=$(jq -r .version /tmp/manifest.json)
+          SHA=$(jq -r .sha256 /tmp/manifest.json)
+
+          test "$VERSION" = "1.2.3"
+          test -f "$PKG"
+          test "$(jq -r .signed /tmp/manifest.json)" = "false"
+          test "$(jq -r .notarized /tmp/manifest.json)" = "false"
+
+          # The manifest hash must match the bytes actually on disk.
+          ACTUAL=$(shasum -a 256 "$PKG" | awk '{print $1}')
+          test "$SHA" = "$ACTUAL"
+
+          # The provenance sidecar must agree with the manifest.
+          PROV="${PKG}.provenance.json"
+          test -f "$PROV"
+          test "$(jq -r .sha256 "$PROV")" = "$SHA"
+          test "$(jq -r .tool "$PROV")" = "munkipkg"
+          test -n "$(jq -r .input_digest "$PROV")"
+
+          # Apple's own tools must accept the package.
+          pkgutil --check-signature "$PKG" || true
+          pkgutil --expand "$PKG" /tmp/expanded
+          grep -q 'version="1.2.3"' /tmp/expanded/PackageInfo
+
+      - name: Check the exit-code ladder
+        run: |
+          set -uo pipefail
+          check() {
+            local expected="$1"; shift
+            set +e
+            "$@" >/dev/null 2>&1
+            local actual=$?
+            set -e
+            if [ "$actual" != "$expected" ]; then
+              echo "expected exit $expected, got $actual for: $*" >&2
+              exit 1
+            fi
+          }
+
+          BIN=./target/release/munkipkg
+
+          check 0  "$BIN" --version
+          check 64 "$BIN" --not-a-real-flag
+          check 2  "$BIN" create /tmp/smoke --format toml
+          check 3  "$BIN" /tmp/definitely-missing
+
+          mkdir -p /tmp/nobuildinfo/payload
+          check 3 "$BIN" /tmp/nobuildinfo
+
+      - name: Upload the built package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-package
+          path: |
+            /tmp/smoke-dist/*.pkg
+            /tmp/smoke-dist/*.provenance.json
+          if-no-files-found: warn

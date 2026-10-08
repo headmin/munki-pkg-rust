@@ -126,6 +126,16 @@ pub struct SigningInfo {
 /// Notarization configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NotarizationInfo {
+    /// Name of a notarytool keychain profile created with
+    /// `xcrun notarytool store-credentials`.
+    ///
+    /// The simplest and safest option: the credentials live in the login
+    /// keychain, nothing sensitive enters build-info, and no environment
+    /// variables are needed at build time. Takes precedence over the other
+    /// authentication methods when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keychain_profile: Option<String>,
+
     /// Apple ID for notarization
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apple_id: Option<String>,
@@ -161,6 +171,106 @@ pub struct NotarizationInfo {
     /// App Store Connect API issuer ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_issuer_id: Option<String>,
+}
+
+/// How a notarization submission authenticates to Apple.
+///
+/// Exactly one method applies per submission. When more than one is configured,
+/// the order below is the precedence: a keychain profile first, because it is
+/// the only one that keeps credentials out of both build-info and the
+/// environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotarizationAuth {
+    /// A profile stored by `xcrun notarytool store-credentials`.
+    KeychainProfile(String),
+
+    /// Apple ID, app-specific password, and Team ID.
+    AppleId {
+        apple_id: String,
+        password: String,
+        team_id: String,
+    },
+
+    /// An App Store Connect API key.
+    ApiKey {
+        key_path: String,
+        key_id: String,
+        issuer_id: String,
+    },
+}
+
+impl NotarizationAuth {
+    /// The `notarytool` arguments for this method.
+    pub fn to_args(&self) -> Vec<String> {
+        match self {
+            NotarizationAuth::KeychainProfile(profile) => {
+                vec!["--keychain-profile".to_string(), profile.clone()]
+            }
+            NotarizationAuth::AppleId {
+                apple_id,
+                password,
+                team_id,
+            } => vec![
+                "--apple-id".to_string(),
+                apple_id.clone(),
+                "--password".to_string(),
+                password.clone(),
+                "--team-id".to_string(),
+                team_id.clone(),
+            ],
+            NotarizationAuth::ApiKey {
+                key_path,
+                key_id,
+                issuer_id,
+            } => vec![
+                "--key".to_string(),
+                key_path.clone(),
+                "--key-id".to_string(),
+                key_id.clone(),
+                "--issuer".to_string(),
+                issuer_id.clone(),
+            ],
+        }
+    }
+
+    /// A short label for status output. Never includes a credential.
+    pub fn description(&self) -> String {
+        match self {
+            NotarizationAuth::KeychainProfile(profile) => {
+                format!("keychain profile \"{}\"", profile)
+            }
+            NotarizationAuth::AppleId { apple_id, .. } => format!("Apple ID {}", apple_id),
+            NotarizationAuth::ApiKey { key_id, .. } => {
+                format!("App Store Connect API key {}", key_id)
+            }
+        }
+    }
+}
+
+impl NotarizationInfo {
+    /// Whether any complete authentication method is configured.
+    ///
+    /// Used by the linter to catch an empty `notarization_info` before a build
+    /// spends minutes getting to the submission step.
+    pub fn has_credentials(&self) -> bool {
+        self.configured_method().is_some()
+    }
+
+    /// Which method is configured, without resolving any secret.
+    fn configured_method(&self) -> Option<&'static str> {
+        if self.keychain_profile.is_some() {
+            Some("keychain_profile")
+        } else if self.apple_id.is_some() && self.password.is_some() && self.team_id.is_some() {
+            Some("apple_id")
+        } else if self.api_key_path.is_some()
+            && self.api_key_id.is_some()
+            && self.api_issuer_id.is_some()
+        {
+            Some("api_key")
+        } else {
+            None
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -289,6 +399,44 @@ impl BuildInfo {
         self.name.replace("${version}", &self.version)
     }
 
+    /// Apply a command-line version override, then stamp dynamic tokens.
+    ///
+    /// Order matters and matches munki-pkg: the override replaces `version`
+    /// first -- so `--pkg-version '${DATE}'` is itself resolvable -- then
+    /// application tokens are read from the payload, then date tokens are
+    /// stamped. `${version}` inside `name` is substituted afterwards by
+    /// [`BuildInfo::resolved_name`], which therefore sees the final version.
+    ///
+    /// The payload is scanned only when an application token is actually
+    /// present, so projects that do not package an app pay nothing for this.
+    pub fn resolve_version(
+        &mut self,
+        version_override: Option<&str>,
+        project_dir: &Path,
+    ) -> Result<()> {
+        if let Some(version) = version_override {
+            self.version = version.to_string();
+        }
+
+        if crate::dynamic_version::contains_app_token(&self.version) {
+            let app = crate::appinfo::find_primary(&project_dir.join("payload"))?;
+            self.version = crate::dynamic_version::resolve_app(&self.version, &app)?;
+        }
+
+        self.version = crate::dynamic_version::resolve(&self.version);
+        Ok(())
+    }
+
+    /// Load build info and resolve its version in one step.
+    ///
+    /// This is what every build path should use: it guarantees the `version`
+    /// field is final before anything reads it.
+    pub fn load_resolved(project_dir: &Path, version_override: Option<&str>) -> Result<Self> {
+        let mut info = Self::load(project_dir)?;
+        info.resolve_version(version_override, project_dir)?;
+        Ok(info)
+    }
+
     /// Load build info from a project directory
     /// Tries formats in order: plist > json > yaml > toml
     pub fn load(project_dir: &Path) -> Result<Self> {
@@ -307,10 +455,11 @@ impl BuildInfo {
             }
         }
 
-        bail!(
+        Err(crate::errors::invalid_config(format!(
             "No build-info file found in {}. Expected one of: build-info.plist, build-info.json, build-info.yaml, or build-info.toml",
             project_dir.display()
-        );
+        ))
+        .into())
     }
 
     /// Load from a specific file
@@ -369,8 +518,10 @@ impl BuildInfo {
 
     /// Validate the configuration
     pub fn validate(&self) -> Result<()> {
+        use crate::errors::invalid_config;
+
         if self.identifier.is_empty() {
-            bail!("Package identifier is required");
+            return Err(invalid_config("Package identifier is required").into());
         }
 
         if self.large_payload {
@@ -380,10 +531,15 @@ impl BuildInfo {
                     && let Ok(major_num) = major.parse::<u32>()
                     && major_num < 12
                 {
-                    bail!("large-payload requires min-os-version >= 12.0");
+                    return Err(
+                        invalid_config("large-payload requires min-os-version >= 12.0").into(),
+                    );
                 }
             } else {
-                bail!("large-payload requires min-os-version to be set (>= 12.0)");
+                return Err(invalid_config(
+                    "large-payload requires min-os-version to be set (>= 12.0)",
+                )
+                .into());
             }
         }
 
@@ -529,6 +685,132 @@ impl BundleInfo {
 }
 
 #[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    fn profile() -> NotarizationInfo {
+        NotarizationInfo {
+            keychain_profile: Some("AC_PASSWORD".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn apple_id() -> NotarizationInfo {
+        NotarizationInfo {
+            apple_id: Some("dev@example.com".to_string()),
+            password: Some("secret".to_string()),
+            team_id: Some("ABC123DEF4".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_keychain_profile_args() {
+        let auth = NotarizationAuth::KeychainProfile("AC_PASSWORD".to_string());
+        assert_eq!(auth.to_args(), vec!["--keychain-profile", "AC_PASSWORD"]);
+    }
+
+    #[test]
+    fn test_apple_id_args() {
+        let auth = NotarizationAuth::AppleId {
+            apple_id: "dev@example.com".to_string(),
+            password: "secret".to_string(),
+            team_id: "ABC123DEF4".to_string(),
+        };
+        assert_eq!(
+            auth.to_args(),
+            vec![
+                "--apple-id",
+                "dev@example.com",
+                "--password",
+                "secret",
+                "--team-id",
+                "ABC123DEF4"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_api_key_args() {
+        let auth = NotarizationAuth::ApiKey {
+            key_path: "/keys/AuthKey.p8".to_string(),
+            key_id: "KEYID".to_string(),
+            issuer_id: "ISSUER".to_string(),
+        };
+        assert_eq!(
+            auth.to_args(),
+            vec![
+                "--key",
+                "/keys/AuthKey.p8",
+                "--key-id",
+                "KEYID",
+                "--issuer",
+                "ISSUER"
+            ]
+        );
+    }
+
+    /// The label appears in build output, so it must never carry a secret.
+    #[test]
+    fn test_description_never_leaks_a_password() {
+        let auth = NotarizationAuth::AppleId {
+            apple_id: "dev@example.com".to_string(),
+            password: "super-secret-password".to_string(),
+            team_id: "ABC123DEF4".to_string(),
+        };
+        assert!(!auth.description().contains("super-secret-password"));
+        assert!(auth.description().contains("dev@example.com"));
+    }
+
+    #[test]
+    fn test_has_credentials() {
+        assert!(profile().has_credentials());
+        assert!(apple_id().has_credentials());
+        assert!(!NotarizationInfo::default().has_credentials());
+    }
+
+    /// An Apple ID without a team ID is incomplete, not a usable method.
+    #[test]
+    fn test_partial_apple_id_is_not_credentials() {
+        let partial = NotarizationInfo {
+            apple_id: Some("dev@example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(!partial.has_credentials());
+    }
+
+    #[test]
+    fn test_keychain_profile_round_trips_through_toml() {
+        let toml_text = "name = \"a.pkg\"\nidentifier = \"com.example.a\"\n\
+                         [notarization_info]\nkeychain_profile = \"AC_PASSWORD\"\n";
+        let info: BuildInfo = toml::from_str(toml_text).unwrap();
+        let notarization = info.notarization_info.unwrap();
+
+        assert_eq!(
+            notarization.keychain_profile.as_deref(),
+            Some("AC_PASSWORD")
+        );
+        assert!(notarization.has_credentials());
+    }
+
+    /// build-info written by the wizard must not carry empty credential keys.
+    #[test]
+    fn test_serialized_profile_config_omits_unset_fields() {
+        let info = BuildInfo {
+            name: "a.pkg".to_string(),
+            identifier: "com.example.a".to_string(),
+            notarization_info: Some(profile()),
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&info).unwrap();
+
+        assert!(text.contains("keychain_profile"));
+        assert!(!text.contains("apple_id"));
+        assert!(!text.contains("password"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -571,7 +853,9 @@ mod tests {
             identifier: "com.example.bundle".to_string(),
             min_os_version: Some("14.0".to_string()),
             install_location: "/".to_string(),
-            components: vec![ComponentRef { name: "app".to_string() }],
+            components: vec![ComponentRef {
+                name: "app".to_string(),
+            }],
             signing_info: None,
             notarization_info: None,
         };
@@ -586,7 +870,9 @@ mod tests {
             identifier: "com.example.test".to_string(),
             min_os_version: None,
             install_location: "/".to_string(),
-            components: vec![ComponentRef { name: "a".to_string() }],
+            components: vec![ComponentRef {
+                name: "a".to_string(),
+            }],
             signing_info: None,
             notarization_info: None,
         };
@@ -614,8 +900,12 @@ mod tests {
             min_os_version: Some("14.0".to_string()),
             install_location: "/".to_string(),
             components: vec![
-                ComponentRef { name: "dialog".to_string() },
-                ComponentRef { name: "cli".to_string() },
+                ComponentRef {
+                    name: "dialog".to_string(),
+                },
+                ComponentRef {
+                    name: "cli".to_string(),
+                },
             ],
             signing_info: None,
             notarization_info: None,

@@ -1,6 +1,6 @@
 [package]
 name = "munkipkg"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 description = "A modern Rust port of munki-pkg - builds macOS installer packages"
 authors = ["Original concept by Greg Neagle (munki-pkg)", "Rust port by Henry Stamerjohann"]

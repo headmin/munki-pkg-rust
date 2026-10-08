@@ -6,7 +6,7 @@
 
 name = "munkipkg-${version}.pkg"
 identifier = "com.github.headmin.munkipkg"
-version = "0.2.2"
+version = "0.2.3"
 
 # Install to /usr/local/bin
 install_location = "/"
